@@ -183,26 +183,65 @@ impl ServeCommand {
             if let Err(err) =
                 enumerate_devices_via_platform_api(state.clone(), Some(client.clone())).await
             {
-                anyhow::bail!(
-                    "Error during initial platform API discovery: {err:#}\n{ISSUE_76_EXPLANATION}"
+                log::warn!(
+                    "Initial platform API discovery failed (will retry in background): {err:#}"
                 );
-            }
-
-            // only record the client after we've completed the
-            // initial platform disco attempt
-            state.set_platform_client(client).await;
-
-            // spawn periodic discovery task
-            let state = state.clone();
-            tokio::spawn(async move {
-                loop {
-                    sleep(Duration::from_secs(600)).await;
-                    if let Err(err) = enumerate_devices_via_platform_api(state.clone(), None).await
-                    {
-                        log::error!("Error during periodic platform API discovery: {err:#}");
+                // Spawn retry loop with exponential backoff
+                let state = state.clone();
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let mut delay = Duration::from_secs(60);
+                    let max_delay = Duration::from_secs(600);
+                    loop {
+                        sleep(delay).await;
+                        log::info!("Retrying platform API discovery...");
+                        match enumerate_devices_via_platform_api(
+                            state.clone(),
+                            Some(client.clone()),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                log::info!("Platform API discovery succeeded on retry");
+                                state.set_platform_client(client).await;
+                                // Switch to normal periodic refresh
+                                loop {
+                                    sleep(Duration::from_secs(600)).await;
+                                    if let Err(err) =
+                                        enumerate_devices_via_platform_api(state.clone(), None)
+                                            .await
+                                    {
+                                        log::error!(
+                                            "Error during periodic platform API discovery: {err:#}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                log::warn!("Platform API retry failed: {err:#}");
+                                delay = std::cmp::min(delay * 2, max_delay);
+                            }
+                        }
                     }
-                }
-            });
+                });
+            } else {
+                // only record the client after we've completed the
+                // initial platform disco attempt
+                state.set_platform_client(client).await;
+
+                // spawn periodic discovery task
+                let state = state.clone();
+                tokio::spawn(async move {
+                    loop {
+                        sleep(Duration::from_secs(600)).await;
+                        if let Err(err) =
+                            enumerate_devices_via_platform_api(state.clone(), None).await
+                        {
+                            log::error!("Error during periodic platform API discovery: {err:#}");
+                        }
+                    }
+                });
+            }
         }
         if let Ok(client) = args.undoc_args.api_client() {
             if let Err(err) = enumerate_devices_via_undo_api(
@@ -212,28 +251,71 @@ impl ServeCommand {
             )
             .await
             {
-                anyhow::bail!(
-                    "Error during initial undoc API discovery: {err:#}\n{ISSUE_76_EXPLANATION}"
+                log::warn!(
+                    "Initial undoc API discovery failed (will retry in background): {err:#}"
                 );
-            }
-
-            // only record the client after we've completed the
-            // initial undoc disco attempt
-            state.set_undoc_client(client).await;
-
-            // spawn periodic discovery task
-            let state = state.clone();
-            let args = args.undoc_args.clone();
-            tokio::spawn(async move {
-                loop {
-                    sleep(Duration::from_secs(600)).await;
-                    if let Err(err) =
-                        enumerate_devices_via_undo_api(state.clone(), None, &args).await
-                    {
-                        log::error!("Error during periodic undoc API discovery: {err:#}");
+                // Spawn retry loop with exponential backoff
+                let state = state.clone();
+                let args_clone = args.undoc_args.clone();
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let mut delay = Duration::from_secs(60);
+                    let max_delay = Duration::from_secs(600);
+                    loop {
+                        sleep(delay).await;
+                        log::info!("Retrying undoc API discovery...");
+                        match enumerate_devices_via_undo_api(
+                            state.clone(),
+                            Some(client.clone()),
+                            &args_clone,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                log::info!("Undoc API discovery succeeded on retry");
+                                state.set_undoc_client(client).await;
+                                // Switch to normal periodic refresh
+                                loop {
+                                    sleep(Duration::from_secs(600)).await;
+                                    if let Err(err) = enumerate_devices_via_undo_api(
+                                        state.clone(),
+                                        None,
+                                        &args_clone,
+                                    )
+                                    .await
+                                    {
+                                        log::error!(
+                                            "Error during periodic undoc API discovery: {err:#}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                log::warn!("Undoc API retry failed: {err:#}");
+                                delay = std::cmp::min(delay * 2, max_delay);
+                            }
+                        }
                     }
-                }
-            });
+                });
+            } else {
+                // only record the client after we've completed the
+                // initial undoc disco attempt
+                state.set_undoc_client(client).await;
+
+                // spawn periodic discovery task
+                let state = state.clone();
+                let args = args.undoc_args.clone();
+                tokio::spawn(async move {
+                    loop {
+                        sleep(Duration::from_secs(600)).await;
+                        if let Err(err) =
+                            enumerate_devices_via_undo_api(state.clone(), None, &args).await
+                        {
+                            log::error!("Error during periodic undoc API discovery: {err:#}");
+                        }
+                    }
+                });
+            }
         }
 
         // Now start LAN discovery
