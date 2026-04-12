@@ -240,10 +240,15 @@ impl GoveeApiClient {
                 }
             };
 
+        // Order matters: earlier entries win on name collisions during
+        // set_scene_by_name lookup. DIY scenes and the dedicated scene
+        // endpoint are authoritative, so they must come before the device
+        // capabilities list, which can contain overlapping "snapshot"
+        // entries that share names with user-created DIY scenes.
         for (origin, caps) in [
-            ("device.capabilities", &device.capabilities),
-            ("scene_caps", &scene_caps),
             ("diy_caps", &diy_caps),
+            ("scene_caps", &scene_caps),
+            ("device.capabilities", &device.capabilities),
             ("undoc_caps", &undoc_caps),
         ] {
             for cap in caps {
@@ -254,6 +259,13 @@ impl GoveeApiClient {
                         | DeviceCapabilityKind::Mode
                 );
                 if !is_scene {
+                    continue;
+                }
+
+                // Skip the "snapshot" instance — these are user-saved
+                // device state captures, not dynamic scenes. They often
+                // share names with DIY scenes which breaks lookup by name.
+                if cap.instance == "snapshot" {
                     continue;
                 }
 
