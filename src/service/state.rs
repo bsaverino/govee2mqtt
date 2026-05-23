@@ -597,31 +597,47 @@ impl State {
     }
 
     pub async fn device_list_scenes(&self, device: &Device) -> anyhow::Result<Vec<String>> {
-        // TODO: some plumbing to maintain offline scene controls for preferred-LAN control
+        // The Platform API list includes user-created DIY scenes that the
+        // generic SKU-level library doesn't have.  Always prefer it; fall
+        // back to the undocumented API only when unavailable.  For devices
+        // reachable via LAN, also merge in the generic list so that
+        // built-in scenes remain discoverable even if the Platform API
+        // returned only a subset.
+        let mut names: Vec<String> = vec![];
+
         if let Some(client) = self.get_platform_client().await {
             if let Some(info) = &device.http_device_info {
-                return Ok(sort_and_dedup_scenes(client.list_scene_names(info).await?));
+                match client.list_scene_names(info).await {
+                    Ok(platform_names) => names.extend(platform_names),
+                    Err(err) => {
+                        log::warn!("Platform API scene list failed for {device}: {err:#}");
+                    }
+                }
             }
         }
 
-        if let Ok(categories) = GoveeUndocumentedApi::get_scenes_for_device(&device.sku).await {
-            let mut names = vec![];
-            for cat in categories {
-                for scene in cat.scenes {
-                    for effect in scene.light_effects {
-                        if effect.scene_code != 0 {
-                            names.push(scene.scene_name);
-                            break;
+        if names.is_empty() {
+            if let Ok(categories) =
+                GoveeUndocumentedApi::get_scenes_for_device(&device.sku).await
+            {
+                for cat in categories {
+                    for scene in cat.scenes {
+                        for effect in scene.light_effects {
+                            if effect.scene_code != 0 {
+                                names.push(scene.scene_name);
+                                break;
+                            }
                         }
                     }
                 }
             }
-            return Ok(sort_and_dedup_scenes(names));
         }
 
-        log::trace!("Platform API unavailable: Don't know how to list scenes for {device}");
+        if names.is_empty() {
+            log::trace!("No scene sources available for {device}");
+        }
 
-        Ok(vec![])
+        Ok(sort_and_dedup_scenes(names))
     }
 
     pub async fn device_set_target_temperature(
@@ -648,30 +664,52 @@ impl State {
         device: &Device,
         scene: &str,
     ) -> anyhow::Result<()> {
-        // TODO: some plumbing to maintain offline scene controls for preferred-LAN control
         let avoid_platform_api = device.avoid_platform_api();
 
+        // Always try the Platform API first: it is the only path that
+        // knows about user-created DIY scenes.  The LAN API only carries
+        // the generic SKU-level scene library, so a DIY scene like
+        // "Default Lights 2026.04" would silently fail there.
         if !avoid_platform_api {
             if let Some(client) = self.get_platform_client().await {
                 if let Some(info) = &device.http_device_info {
                     log::info!("Using Platform API to set {device} to scene {scene}");
-                    client.set_scene_by_name(info, scene).await?;
-                    self.device_mut(&device.sku, &device.id)
-                        .await
-                        .set_active_scene(Some(scene));
-                    return Ok(());
+                    match client.set_scene_by_name(info, scene).await {
+                        Ok(_) => {
+                            self.device_mut(&device.sku, &device.id)
+                                .await
+                                .set_active_scene(Some(scene));
+                            return Ok(());
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "Platform API failed to set scene '{scene}' on {device}: \
+                                 {err:#}. Will try LAN API fallback."
+                            );
+                        }
+                    }
                 }
             }
         }
 
         if let Some(lan_dev) = &device.lan_device {
             log::info!("Using LAN API to set {device} to scene {scene}");
-            lan_dev.set_scene_by_name(scene).await?;
-
-            self.device_mut(&device.sku, &device.id)
-                .await
-                .set_active_scene(Some(scene));
-            return Ok(());
+            match lan_dev.set_scene_by_name(scene).await {
+                Ok(_) => {
+                    self.device_mut(&device.sku, &device.id)
+                        .await
+                        .set_active_scene(Some(scene));
+                    return Ok(());
+                }
+                Err(err) => {
+                    log::warn!(
+                        "LAN API failed to set scene '{scene}' on {device}: {err:#}. \
+                         If this is a DIY scene, it can only be activated via \
+                         the Platform API."
+                    );
+                    return Err(err);
+                }
+            }
         }
 
         anyhow::bail!("Unable to set scene for {device}");
